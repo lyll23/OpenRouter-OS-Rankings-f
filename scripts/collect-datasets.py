@@ -85,6 +85,11 @@ def plan(today):
         if start > stop: continue
         for period, flt in rank_filters:
             out.append(task('rankings-daily',dict(start_date=str(start),end_date=str(stop),period=period,**flt),'rankings-'+period))
+    # The first verified 2025 annual response omitted these dates. Probe exact days
+    # separately under the normal budget; absence is never converted to zero.
+    for missing in ['2025-06-15','2025-07-15']:
+        if dt.date.fromisoformat(missing)<=end:
+            out.append(task('rankings-daily',dict(start_date=missing,end_date=missing,period='day'),'rankings-gap-probe'))
     # Interleave all slices within each source date, newest historical dates first.
     for age in range(1,(end-START).days+1): out.extend(apps(end-dt.timedelta(days=age)))
     seen=set(); unique=[]
