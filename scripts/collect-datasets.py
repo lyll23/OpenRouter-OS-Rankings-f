@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Archive public OpenRouter Datasets with bounded, resumable requests (stdlib only)."""
-import argparse, datetime as dt, gzip, hashlib, json, os, sys, time
+import argparse, datetime as dt, gzip, hashlib, json, os, sys, time, copy
 import urllib.request, urllib.error, urllib.parse
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -97,11 +97,22 @@ def plan(today):
         if t['id'] not in seen: seen.add(t['id']); unique.append(t)
     return unique
 
-def reserve(root, lease_id, today, requested):
+ACCOUNTS = ('account1','account2')
+SHARD_VERSION = 'sha256-task-id-mod2-v1'
+def owner(task_id): return ACCOUNTS[int(task_id,16)%2]
+def migrate(state):
+    if 'accounts' not in state:
+        state['accounts']={'account1':{k:copy.deepcopy(state[k]) for k in ('budget','leases','not_before') if k in state},'account2':{'budget':{},'leases':{}}}
+        state['version']=2; state['shard_version']=SHARD_VERSION
+    if state.get('shard_version')!=SHARD_VERSION: raise ValueError('Unknown shard strategy')
+    return state
+
+def reserve(root, lease_id, today, requested, account=None):
     root=Path(root); state=load_json(root/'checkpoint.json',{'version':1,'tasks':{},'budget':{}})
-    leases=state.setdefault('leases',{})
+    ledger=migrate(state)['accounts'][account] if account else state
+    leases=ledger.setdefault('leases',{})
     if lease_id in leases: return leases[lease_id]['remaining']
-    budget=state['budget'].setdefault(str(today),{'attempts':0,'reserved':0})
+    budget=ledger['budget'].setdefault(str(today),{'attempts':0,'reserved':0})
     grant=max(0,min(requested,MAX_DAILY_REQUESTS-budget.get('reserved',0)))
     budget['reserved']=budget.get('reserved',0)+grant
     leases[lease_id]={'day':str(today),'granted':grant,'remaining':grant}
@@ -135,13 +146,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 class Collector:
-    def __init__(self, root, key, *, now=utcnow, transport=None, limit=MAX_DAILY_REQUESTS, lease=None, probe=False, sleep=time.sleep):
+    def __init__(self, root, key, *, now=utcnow, transport=None, limit=MAX_DAILY_REQUESTS, lease=None, probe=False, sleep=time.sleep, account=None):
         self.root=Path(root); self.key=key; self.now=now; self.transport=transport or self.http
         self.limit=min(MAX_DAILY_REQUESTS,max(0,limit)); self.today=self.now().date()
         self.state=load_json(self.root/'checkpoint.json',{'version':1,'tasks':{},'budget':{}})
-        self.run={'started_at':iso(self.now()),'requests':0,'outcomes':{},'blocked':None}
+        self.account=account
+        if account:
+            if account not in ACCOUNTS: raise ValueError('Invalid account')
+            ledger=migrate(self.state)['accounts'][account]
+            for k in ('budget','leases','not_before'):
+                self.state.pop(k,None)
+                if k in ledger: self.state[k]=copy.deepcopy(ledger[k])
+        self.checkpoint_path=self.root/('worker-state/'+account+'.json' if account else 'checkpoint.json')
+        self.run={'account':account,'shard_version':SHARD_VERSION if account else None,'started_at':iso(self.now()),'requests':0,'outcomes':{},'blocked':None}
         self.stop=False; self.lease=lease; self.probe=probe; self.sleep=sleep; self.last_request=None
-    def save(self): write_json(self.root/'checkpoint.json',self.state)
+    def save(self): write_json(self.checkpoint_path,self.state)
     def http(self,url):
         req=urllib.request.Request(url, headers={'Authorization':'Bearer '+self.key,'Accept':'application/json','User-Agent':'OpenRouter-public-datasets-archive/1.0'})
         try:
@@ -168,8 +187,8 @@ class Collector:
         stamp=iso(self.now())
         try: status,headers,raw=self.transport(url)
         except (OSError,TimeoutError): status,headers,raw=0,{},b''
-        record={'requested_at':stamp,'endpoint':t['endpoint'],'params':params,'http_status':status,'response_sha256':digest(raw),'bytes':len(raw)}
-        record_path=self.root/'attempts'/day/(f"{budget['attempts']:04d}.json")
+        record={'account':self.account,'requested_at':stamp,'endpoint':t['endpoint'],'params':params,'http_status':status,'response_sha256':digest(raw),'bytes':len(raw)}
+        record_path=self.root/'attempts'/(self.account or 'legacy')/day/(f"{budget['attempts']:04d}.json")
         if status==429:
             retry=next((v for k,v in headers.items() if k.lower()=='retry-after'),None)
             delay=max(1,int((dt.datetime.combine(self.today+dt.timedelta(days=1),dt.time(),tzinfo=dt.timezone.utc)-self.now()).total_seconds()))
@@ -206,6 +225,7 @@ class Collector:
         write_json(record_path,record); self.save()
         return record,body,str(record_path.relative_to(self.root))
     def collect(self,t):
+        if self.account and owner(t['id'])!=self.account: raise ValueError('Wrong account partition')
         previous=self.state['tasks'].get(t['id'],{})
         # Resume partial pagination only for the same UTC fetch day. A new day restarts,
         # avoiding combining pages from distinct weekly session snapshots.
@@ -254,27 +274,29 @@ class Collector:
         self.run['outcomes'][outcome['status']]=self.run['outcomes'].get(outcome['status'],0)+1
         self.save()
     def execute(self):
-        tasks=probe_plan(self.today) if self.probe else plan(self.today)
+        tasks=probe_plan(self.today) if self.probe and not self.account else plan(self.today)
+        if self.account: tasks=[t for t in tasks if owner(t['id'])==self.account]
         for t in prioritize(tasks,self.state['tasks'],self.today):
             if eligible(t,self.state['tasks'].get(t['id']),self.today): self.collect(t)
             if self.stop: break
         self.run['source_states']={s:sum(v.get('status')==s for v in self.state['tasks'].values()) for s in sorted({v.get('status','unknown') for v in self.state['tasks'].values()})}
         self.run.update(finished_at=iso(self.now()),planned_tasks=len(tasks),pending_tasks=sum(eligible(t,self.state['tasks'].get(t['id']),self.today) for t in tasks),daily_requests=self.state['budget'].get(str(self.today),{}).get('attempts',0),daily_limit=self.limit,reserved_requests=500-self.limit,scope='Documented public dataset slices; not all platform traffic; historical session-cost unavailable')
-        write_json(self.root/'reports'/(iso(self.now()).replace(':','-')+'.json'),self.run)
-        write_json(self.root/'latest-report.json',self.run)
+        write_json(self.root/'reports'/(self.account or 'legacy')/(iso(self.now()).replace(':','-')+'.json'),self.run)
+        write_json(self.root/('latest-report-'+self.account+'.json' if self.account else 'latest-report.json'),self.run)
+        self.save()
         return self.run
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); p.add_argument('--account',choices=ACCOUNTS); args=p.parse_args()
     if args.plan:
         tasks=plan(utcnow().date()); print(json.dumps({'tasks':len(tasks),'by_family':{f:sum(t['family']==f for t in tasks) for f in sorted(set(t['family'] for t in tasks))}},indent=2)); return
     if args.reserve:
         if not args.lease: raise SystemExit('--lease required')
-        print(reserve(args.root,args.lease,utcnow().date(),args.limit)); return
+        print(reserve(args.root,args.lease,utcnow().date(),args.limit,account=args.account)); return
     if not args.lease: raise SystemExit('Production requests require a remotely committed --lease')
     key=os.environ.get('OPENROUTER_API_KEY')
     if not key: raise SystemExit('OPENROUTER_API_KEY is not configured')
-    collector=Collector(args.root,key,limit=MAX_DAILY_REQUESTS,lease=args.lease,probe=args.probe); report=collector.execute(); print(json.dumps(report,indent=2))
+    collector=Collector(args.root,key,limit=MAX_DAILY_REQUESTS,lease=args.lease,probe=args.probe,account=args.account); report=collector.execute(); print(json.dumps(report,indent=2))
     if report['blocked'] in ('authentication_or_access',): raise SystemExit(1)
     if any(report['outcomes'].get(s,0) for s in ('invalid_response','source_error','deferred_error')) and report['blocked']!='http_429': raise SystemExit(1)
 if __name__=='__main__': main()
