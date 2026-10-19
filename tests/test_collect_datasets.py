@@ -78,4 +78,14 @@ class Tests(unittest.TestCase):
  def test_negative_metric_is_rejected(self):
   c=self.collector([ok([{'total_tokens':'-1'}])]);t=m.task('app-rankings',{},'app-rankings');c.collect(t)
   self.assertEqual(c.state['tasks'][t['id']]['status'],'invalid_response')
+ def test_unseen_history_precedes_due_empty(self):
+  old=m.task('app-rankings',{'end_date':'2025-06-01'},'app-rankings')
+  unseen=m.task('app-rankings',{'end_date':'2025-05-01'},'app-rankings')
+  latest=m.task('app-rankings',{'end_date':'2026-10-18'},'app-rankings')
+  order=m.prioritize([old,unseen,latest],{old['id']:{'status':'source_empty'}},NOW.date())
+  self.assertEqual([t['id'] for t in order],[latest['id'],unseen['id'],old['id']])
+ def test_no_credential_redirect(self):
+  handler=m.NoRedirect()
+  req=m.urllib.request.Request(m.BASE+'session-cost',headers={'Authorization':'Bearer TEST'})
+  self.assertIsNone(handler.redirect_request(req,None,302,'Found',{},'https://example.com/'))
 if __name__=='__main__': unittest.main()

@@ -114,6 +114,21 @@ def eligible(t, previous, today):
     if t['refresh'] and previous.get('checked_date') != str(today): return True
     return previous.get('status') not in ('complete','source_empty','pagination_cap','source_error','deferred_error','invalid_response')
 
+def prioritize(tasks, state, today):
+    """Current observations first; unseen historical slices cannot be starved by retries."""
+    latest=str(today-dt.timedelta(days=1))
+    def priority(t):
+        if t['endpoint']=='session-cost' or t['params'].get('end_date')==latest: return 0
+        previous=state.get(t['id'])
+        if not previous or previous.get('status')=='pending': return 1
+        return 2
+    return sorted(tasks,key=priority)
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward an Authorization header to a redirected destination.
+        return None
+
 class Collector:
     def __init__(self, root, key, *, now=utcnow, transport=None, limit=MAX_DAILY_REQUESTS, lease=None, probe=False, sleep=time.sleep):
         self.root=Path(root); self.key=key; self.now=now; self.transport=transport or self.http
@@ -125,7 +140,7 @@ class Collector:
     def http(self,url):
         req=urllib.request.Request(url, headers={'Authorization':'Bearer '+self.key,'Accept':'application/json','User-Agent':'OpenRouter-public-datasets-archive/1.0'})
         try:
-            with urllib.request.urlopen(req,timeout=90) as r: return r.status,dict(r.headers),r.read()
+            with urllib.request.build_opener(NoRedirect()).open(req,timeout=90) as r: return r.status,dict(r.headers),r.read()
         except urllib.error.HTTPError as e: return e.code,dict(e.headers),e.read()
     def request(self,t,params):
         day=str(self.now().date())
@@ -222,7 +237,10 @@ class Collector:
             outcome['rows']=sum(load_json(self.root/p,{})['rows'] for p in pages)
             if not paged or len(body['data'])<size:
                 outcome['status']='complete' if outcome['rows'] else 'source_empty'
-                if not outcome['rows']: outcome['retry_on']=str(self.today+dt.timedelta(days=14))
+                if not outcome['rows']:
+                    source_end=t['params'].get('end_date',str(self.today))
+                    old=dt.date.fromisoformat(source_end)<self.today-dt.timedelta(days=30)
+                    outcome['retry_on']=str(self.today+dt.timedelta(days=90 if old else 14))
                 break
             if offset>=cap:
                 outcome.update(status='pagination_cap',reason='last_allowed_page_full; completeness_not_proven'); break
@@ -232,7 +250,7 @@ class Collector:
         self.save()
     def execute(self):
         tasks=probe_plan(self.today) if self.probe else plan(self.today)
-        for t in tasks:
+        for t in prioritize(tasks,self.state['tasks'],self.today):
             if eligible(t,self.state['tasks'].get(t['id']),self.today): self.collect(t)
             if self.stop: break
         self.run['source_states']={s:sum(v.get('status')==s for v in self.state['tasks'].values()) for s in sorted({v.get('status','unknown') for v in self.state['tasks'].values()})}
