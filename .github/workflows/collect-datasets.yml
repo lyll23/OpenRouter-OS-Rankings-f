@@ -1,0 +1,68 @@
+name: Archive public datasets
+on:
+  schedule:
+    - cron: '45 7 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/collect-datasets.yml'
+      - 'scripts/collect-datasets.py'
+      - 'config/datasets.json'
+permissions:
+  contents: write
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test collector
+        run: python -m unittest discover -s tests -v
+      - name: Reserve daily request budget before any API calls
+        id: reserve
+        env:
+          LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git pull --ff-only
+          ENABLED=$(python -c 'import json; print(str(json.load(open("config/datasets.json"))["production_enabled"]).lower())')
+          LIMIT=12
+          MODE=--probe
+          if [ "$ENABLED" = true ]; then LIMIT=450; MODE=; fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          python scripts/collect-datasets.py --reserve --lease "$LEASE" --limit "$LIMIT"
+          git add data/datasets/checkpoint.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Reserve datasets request budget ($LEASE)"
+            git push
+          fi
+      - name: Fetch and archive public aggregate datasets
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
+          MODE: ${{ steps.reserve.outputs.mode }}
+        run: python scripts/collect-datasets.py --lease "$LEASE" $MODE
+      - name: Save raw data, audit records and checkpoints
+        if: always() && steps.reserve.outcome == 'success'
+        run: |
+          git add data/datasets
+          if ! git diff --cached --quiet; then
+            git commit -m "Archive datasets and progress ($(date -u +%FT%TZ))"
+            git pull --rebase
+            git push
+          fi
+      - name: Retain recovery copy if Git persistence fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datasets-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data/datasets/
+          retention-days: 14
