@@ -35,3 +35,15 @@ Documentation checked 2026-10-19:
 - https://openrouter.ai/docs/api/api-reference/datasets/top-apps-by-token-usage
 - https://openrouter.ai/docs/api/api-reference/datasets/daily-token-totals-for-top-50-models
 - https://openrouter.ai/docs/api/api-reference/datasets/cost-per-session-by-harness-and-model
+
+## Two independently authorized account partitions (2026-10-19)
+
+The workflow now has one serial preparation job, two parallel collection jobs, and one serial publication job. It references existing `OPENROUTER_API_KEY` and `OPENROUTER_API_KEY_2` secrets separately; no key is extracted or written. Each task (including its entire pagination) is assigned by `int(task_id,16) % 2` to the fixed account order `account1`, `account2`, with strategy version `sha256-task-id-mod2-v1`. There is no failover to the other key after a 429 or authentication error.
+
+Migration retains the original checkpoint's top-level budget/leases as historical evidence and copies them into `accounts.account1`. From migration onward, `accounts` contains the authoritative independent ledgers. On the migration date account1 retains all 450 reserved slots and 449 actual attempts; they are not reset. Account2 starts with an independent 12-request contract test on its previously unattempted partition. Only after response and persistence review does `account2_production_enabled` allow up to 450 reservations per UTC day. Fifty requests per account remain outside this collector's allocation; other external usage remains unknown.
+
+Both workers read the same committed task checkpoint and independently use their allocated partition. They never push directly. Their changed raw responses, audit records and result checkpoint are transferred as SHA-256 manifests in 30-day recovery artifacts. Publication validates hashes, task identities, partition ownership, immutable-file conflicts and nonincreasing reserved lease balances before merging only each account's owned tasks and ledger. Missing or invalid worker results leave its reservation intact; the other valid worker's results are still saved. A failed worker or persistence step keeps the overall workflow failed, even if the other shard succeeded.
+
+Storage is still durable in this repository, not solely on an ephemeral runner. At the first run, compressed raw files were approximately 3.92 MiB (the full local directory occupied about 7.3 MiB including audit files and filesystem overhead). There is no present need to remove history or migrate storage. A future local download/export can supplement the archive; the assistant's temporary cloud filesystem is not the user's computer. No historical files are removed or rewritten by this migration.
+
+For manual recovery, rerun **all jobs**, including preparation, so a new run attempt receives a fresh bounded lease. Rerunning only failed collection jobs without preparation intentionally has no matching lease and makes no API calls; it cannot reclaim an old reservation.
