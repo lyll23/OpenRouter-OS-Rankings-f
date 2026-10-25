@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/collect-datasets.yml'
       - 'scripts/collect-datasets.py'
+      - 'scripts/datasets-transfer.py'
       - 'config/datasets.json'
 permissions:
   contents: write
@@ -15,17 +16,17 @@ concurrency:
   group: refresh
   cancel-in-progress: false
 jobs:
-  archive:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      checkpoint_ref: ${{ steps.reserve.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Test collector
-        run: python -m unittest discover -s tests -v
-      - name: Reserve daily request budget before any API calls
+      - run: python -m unittest discover -s tests -v
+      - name: Reserve isolated account budgets before API calls
         id: reserve
         env:
           LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -33,36 +34,88 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git pull --ff-only
-          ENABLED=$(python -c 'import json; print(str(json.load(open("config/datasets.json"))["production_enabled"]).lower())')
-          LIMIT=12
-          MODE=--probe
-          if [ "$ENABLED" = true ]; then LIMIT=450; MODE=; fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          python scripts/collect-datasets.py --reserve --lease "$LEASE" --limit "$LIMIT"
+          LIMIT1=$(python -c 'import json; c=json.load(open("config/datasets.json")); print(450 if c["production_enabled"] else 12)')
+          LIMIT2=$(python -c 'import json; c=json.load(open("config/datasets.json")); print(450 if c.get("account2_production_enabled", False) else 12)')
+          python scripts/collect-datasets.py --reserve --account account1 --lease "$LEASE-account1" --limit "$LIMIT1"
+          python scripts/collect-datasets.py --reserve --account account2 --lease "$LEASE-account2" --limit "$LIMIT2"
           git add data/datasets/checkpoint.json
           if ! git diff --cached --quiet; then
-            git commit -m "Reserve datasets request budget ($LEASE)"
+            git commit -m "Reserve isolated datasets budgets ($LEASE)"
             git push
           fi
-      - name: Fetch and archive public aggregate datasets
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  collect:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: account1
+            secret_name: OPENROUTER_API_KEY
+          - account: account2
+            secret_name: OPENROUTER_API_KEY_2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkpoint_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Collect only this account's task partition
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
-          MODE: ${{ steps.reserve.outputs.mode }}
-        run: python scripts/collect-datasets.py --lease "$LEASE" $MODE
-      - name: Save raw data, audit records and checkpoints
-        if: always() && steps.reserve.outcome == 'success'
+          OPENROUTER_API_KEY: ${{ secrets[matrix.secret_name] }}
+          ACCOUNT: ${{ matrix.account }}
+          LEASE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.account }}
+        run: python scripts/collect-datasets.py --account "$ACCOUNT" --lease "$LEASE"
+      - name: Package auditable result delta
+        if: always()
+        env:
+          ACCOUNT: ${{ matrix.account }}
+        run: python scripts/datasets-transfer.py package --account "$ACCOUNT" --payload "transfer/$ACCOUNT"
+      - name: Retain result for serial publication and recovery
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datasets-${{ matrix.account }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transfer/${{ matrix.account }}/
+          retention-days: 30
+          if-no-files-found: error
+  publish:
+    needs: [prepare, collect]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: datasets-account1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transfer/account1
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: datasets-account2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: transfer/account2
+        continue-on-error: true
+      - name: Validate and merge independent result deltas
+        run: python scripts/datasets-transfer.py merge --payload transfer
+      - name: Persist successful shards even if another failed
+        if: always()
         run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add data/datasets
           if ! git diff --cached --quiet; then
-            git commit -m "Archive datasets and progress ($(date -u +%FT%TZ))"
+            git commit -m "Archive parallel datasets results ($(date -u +%FT%TZ))"
             git pull --rebase
             git push
           fi
-      - name: Retain recovery copy if Git persistence fails
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: datasets-recovery-${{ github.run_id }}-${{ github.run_attempt }}
-          path: data/datasets/
-          retention-days: 14
+      - name: Preserve failure status from collection
+        if: needs.collect.result != 'success'
+        run: exit 1
