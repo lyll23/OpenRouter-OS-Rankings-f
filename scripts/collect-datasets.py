@@ -262,10 +262,17 @@ class Collector:
         self.run.update(finished_at=iso(self.now()),planned_tasks=len(tasks),pending_tasks=sum(eligible(t,self.state['tasks'].get(t['id']),self.today) for t in tasks),daily_requests=self.state['budget'].get(str(self.today),{}).get('attempts',0),daily_limit=self.limit,reserved_requests=500-self.limit,scope='Documented public dataset slices; not all platform traffic; historical session-cost unavailable')
         write_json(self.root/'reports'/(iso(self.now()).replace(':','-')+'.json'),self.run)
         write_json(self.root/'latest-report.json',self.run)
+        # Additive provenance only: never change raw attempts or completeness gates.
+        from dataset_versions import index_session_cost
+        index_session_cost(self.root, validate)
         return self.run
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); p.add_argument('--index-session-cost',action='store_true'); p.add_argument('--session-cost-research',action='store_true'); args=p.parse_args()
+    if args.index_session_cost or args.session_cost_research:
+        from dataset_versions import index_session_cost, session_cost_research
+        result = session_cost_research(args.root, validate) if args.session_cost_research else index_session_cost(args.root, validate)
+        print(json.dumps(result, ensure_ascii=False, indent=2)); return
     if args.plan:
         tasks=plan(utcnow().date()); print(json.dumps({'tasks':len(tasks),'by_family':{f:sum(t['family']==f for t in tasks) for f in sorted(set(t['family'] for t in tasks))}},indent=2)); return
     if args.reserve:

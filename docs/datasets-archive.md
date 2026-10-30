@@ -35,3 +35,44 @@ Documentation checked 2026-10-19:
 - https://openrouter.ai/docs/api/api-reference/datasets/top-apps-by-token-usage
 - https://openrouter.ai/docs/api/api-reference/datasets/daily-token-totals-for-top-50-models
 - https://openrouter.ai/docs/api/api-reference/datasets/cost-per-session-by-harness-and-model
+
+## Session-cost 版本与研究筛选（2026-10-30）
+
+所有安全且通过响应级校验的原始分页继续保留在 `raw/`，每次请求记录仍在
+`attempts/`，不覆盖或删除旧版本。不通过安全校验的响应体仍不入库，防止凭据或
+私人字段泄露；保留请求状态与哈希，不能声称这种响应体已归档。
+
+新增 `versions/session-cost/<batch_id>.json` 为派生索引，每次计划采集结束自动更新。
+它从原有 attempts/raw 离线重建，包含同一查询及抓取日内从 offset=0 开始的一批
+请求；再次 offset=0 即新批次，跨抓取日不拼接。相同正文可以共享内容寻址 raw，
+但各次请求、抓取时间和批次仍独立记录。中断批次续页时，同一批次索引可更新，
+原始 attempts/raw 不变。旧数据没有新标签时可离线生成，不需要补抓。
+
+每页索引包含：请求时间、源 `as_of`/`version`/窗口、offset/limit、attempt/raw 路径、
+原始体与 gzip SHA256、长度、行数和完整性校验结果。批次包含源版本一致性、
+分页完整性、`status`、`research_eligible` 和原因。`observed_rows` 是各页观测数，
+不表示可合并的完整截面。例如 A 版本第一页500条加 B 版本第二页137条会标
+`inconsistent`、完整性 `unconfirmed`、`research_eligible=false`；不会被包装为
+两版完整数据或同一版637条。匹配窗口但不同 as_of 也不放行。
+
+离线重建标签（不调用 API、不改 checkpoint/历史 raw）：
+
+    python scripts/collect-datasets.py --root data/datasets --index-session-cost
+
+研究导出（只读、无需密钥；完整历史批次，不盲目只保留最新版）：
+
+    python scripts/collect-datasets.py --root data/datasets --session-cost-research > session-cost-research.json
+
+导出重新验证每个原始 gzip/正文哈希、长度、schema、身份、页码连续性、所有页面
+meta 完全一致及末页少于500条。只有非空且完整的批次进入 `complete_batches`。
+不同查询分组不合并。每组同时保留 `latest_attempt` 和 `latest_complete_batch_id`；
+若新批失败而旧完整批存在，`last_complete_is_older_attempt=true`，不冒充当前新鲜数据。
+没有完整批次时导出空列表，不把缺失变0。使用者应保留 manifest 的源日/抓取日/
+批次ID，不能自行把不同批次扁平拼为同一截面。该视图不代表完整UTC日用量。
+
+此次没有增加 API 请求/重试、改变450请求预算、删除历史或放宽 Action 失败门禁。
+因此源站持续跨页版本不一致时 Action 仍可失败，但原始片段与其标签均可追溯。
+
+首次上线仅新增10月28日、29日两个已核验批次的派生标签；两批均为跨页版本不一致，
+不进入完整研究视图。其他旧日期在下次正常计划运行结束时自动生成索引；离线研究
+导出本身也会直接从全部本地 attempts/raw 重验，不依赖标签是否已经落盘。
