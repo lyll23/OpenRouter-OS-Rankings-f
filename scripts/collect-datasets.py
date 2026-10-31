@@ -139,7 +139,7 @@ class Collector:
         self.root=Path(root); self.key=key; self.now=now; self.transport=transport or self.http
         self.limit=min(MAX_DAILY_REQUESTS,max(0,limit)); self.today=self.now().date()
         self.state=load_json(self.root/'checkpoint.json',{'version':1,'tasks':{},'budget':{}})
-        self.run={'started_at':iso(self.now()),'requests':0,'outcomes':{},'blocked':None}
+        self.run={'started_at':iso(self.now()),'requests':0,'outcomes':{},'task_outcomes':[],'lease':lease,'blocked':None}
         self.stop=False; self.lease=lease; self.probe=probe; self.sleep=sleep; self.last_request=None
     def save(self): write_json(self.root/'checkpoint.json',self.state)
     def http(self,url):
@@ -251,6 +251,7 @@ class Collector:
                 outcome.update(status='pagination_cap',reason='last_allowed_page_full; completeness_not_proven'); break
             offset+=size; self.save()
             if self.stop: break
+        self.run['task_outcomes'].append({'task_id':t['id'], 'status':outcome['status'], 'outcome':json.loads(encoded(outcome))})
         self.run['outcomes'][outcome['status']]=self.run['outcomes'].get(outcome['status'],0)+1
         self.save()
     def execute(self):
@@ -268,7 +269,17 @@ class Collector:
         return self.run
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); p.add_argument('--index-session-cost',action='store_true'); p.add_argument('--session-cost-research',action='store_true'); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--root',default='data/datasets'); p.add_argument('--plan',action='store_true'); p.add_argument('--limit',type=int,default=MAX_DAILY_REQUESTS); p.add_argument('--reserve',action='store_true'); p.add_argument('--lease'); p.add_argument('--probe',action='store_true'); p.add_argument('--index-session-cost',action='store_true'); p.add_argument('--session-cost-research',action='store_true'); p.add_argument('--verify-exit-policy',action='store_true'); args=p.parse_args()
+    if args.verify_exit_policy:
+        from dataset_exit_policy import exit_code, verified_warnings
+        report=load_json(Path(args.root)/'latest-report.json',{})
+        if not args.lease or report.get('lease') != args.lease:
+            raise SystemExit('Current lease report missing or stale')
+        code=exit_code(args.root,report,validate)
+        if code == 1: raise SystemExit(1)
+        for batch in verified_warnings(args.root,report,validate):
+            print('::warning::session-cost snapshot inconsistent; archived and excluded from complete research data. Batch '+batch)
+        return
     if args.index_session_cost or args.session_cost_research:
         from dataset_versions import index_session_cost, session_cost_research
         result = session_cost_research(args.root, validate) if args.session_cost_research else index_session_cost(args.root, validate)
@@ -282,6 +293,7 @@ def main():
     key=os.environ.get('OPENROUTER_API_KEY')
     if not key: raise SystemExit('OPENROUTER_API_KEY is not configured')
     collector=Collector(args.root,key,limit=MAX_DAILY_REQUESTS,lease=args.lease,probe=args.probe); report=collector.execute(); print(json.dumps(report,indent=2))
-    if report['blocked'] in ('authentication_or_access',): raise SystemExit(1)
-    if any(report['outcomes'].get(s,0) for s in ('invalid_response','source_error','deferred_error')) and report['blocked']!='http_429': raise SystemExit(1)
+    from dataset_exit_policy import exit_code
+    # Exit 75 is provisional: the workflow must persist and verify before warning.
+    raise SystemExit(exit_code(args.root,report,validate))
 if __name__=='__main__': main()

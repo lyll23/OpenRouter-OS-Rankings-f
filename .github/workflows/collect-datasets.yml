@@ -45,11 +45,19 @@ jobs:
             git push
           fi
       - name: Fetch and archive public aggregate datasets
+        id: collect
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
           MODE: ${{ steps.reserve.outputs.mode }}
-        run: python scripts/collect-datasets.py --lease "$LEASE" $MODE
+        run: |
+          set +e
+          python scripts/collect-datasets.py --lease "$LEASE" $MODE
+          code=$?
+          set -e
+          # Only the explicit, locally verified quarantine code may proceed.
+          if [ "$code" != 0 ] && [ "$code" != 75 ]; then exit "$code"; fi
+          echo "archive_ready=true" >> "$GITHUB_OUTPUT"
       - name: Save raw data, audit records and checkpoints
         if: always() && steps.reserve.outcome == 'success'
         run: |
@@ -59,6 +67,17 @@ jobs:
             git pull --rebase
             git push
           fi
+      - name: Verify remote persistence and classify source warning
+        if: success() && steps.collect.outputs.archive_ready == 'true'
+        env:
+          LEASE: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          # Verify the complete archive tree fetched from GitHub, not just push exit.
+          git fetch origin main
+          git diff --exit-code HEAD origin/main -- data/datasets
+          git diff --exit-code HEAD -- data/datasets
+          test -z "$(git ls-files --others --exclude-standard data/datasets)"
+          python scripts/collect-datasets.py --verify-exit-policy --lease "$LEASE"
       - name: Retain recovery copy if Git persistence fails
         if: failure()
         uses: actions/upload-artifact@v4
@@ -66,3 +85,4 @@ jobs:
           name: datasets-recovery-${{ github.run_id }}-${{ github.run_attempt }}
           path: data/datasets/
           retention-days: 14
+
