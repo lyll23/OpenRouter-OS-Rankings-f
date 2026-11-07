@@ -91,3 +91,17 @@ meta 完全一致及末页少于500条。只有非空且完整的批次进入 `c
 HTTP 429 的正常 Retry-After 停止保留，但不会掩盖同轮其他错误。
 原始档案和研究筛选规则保持不变，日报继续报告不完整批次。
 本次未增加重试、请求预算或更改定时计划。
+
+### Bounded Git persistence retries (2026-11-06)
+
+Budget reservation and final archive pushes use `scripts/push-datasets.py`.
+It makes at most three normal, non-force push attempts, waiting 10 then 30
+seconds for recognized transient transport/server failures. Each attempt first
+fetches the remote, including after an uncertain push result. Success requires
+the intended commit to be reachable and the complete remote datasets tree to
+match the committed local tree. Dirty data, remote divergence, permission/rule
+rejections, unknown errors, or changed remote dataset content stop without
+force, automatic rebase, or relaxing the collector quality gates. A command
+exceeding the 180-second subprocess timeout fails safely rather than retrying.
+The existing failure recovery artifact and final source-warning verification
+remain in place. No request budget, data selection, or schedule is changed.
