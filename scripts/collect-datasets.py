@@ -13,6 +13,8 @@ RANK_CATEGORIES = ['programming','roleplay','marketing','marketing/seo','technol
 EXACT = [('modality', v) for v in ['text','image','image_output','audio','tool_calling']] + [('context_bucket', v) for v in ['1K','10K','100K','1M','10M']]
 WEEKLY = [('category',v) for v in RANK_CATEGORIES] + [('language_type',v) for v in ['natural','programming']]
 MAX_DAILY_REQUESTS = 450  # 50 reserved for the existing annual refresh / manual calls.
+EARLY_RETRY_TASKS = 10  # At most 20 requests for historical app slices; within the same lease.
+ERROR_STATES = frozenset(('source_error', 'deferred_error', 'invalid_response'))
 
 def encoded(x): return json.dumps(x, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
 def digest(b): return hashlib.sha256(b).hexdigest()
@@ -120,13 +122,27 @@ def eligible(t, previous, today):
     return previous.get('status') not in ('complete','source_empty','pagination_cap','source_error','deferred_error','invalid_response')
 
 def prioritize(tasks, state, today):
-    """Current observations first; unseen historical slices cannot be starved by retries."""
+    """Current observations, bounded due failures, unseen history, remaining retries.
+
+    Earliest retry date wins the bounded lane. Retried failures receive a new
+    retry date in collect(), so a persistent error cannot monopolize the lane.
+    Known source-empty results stay behind unseen history.
+    """
     latest=str(today-dt.timedelta(days=1))
+    def current(t):
+        return t['endpoint']=='session-cost' or t['params'].get('end_date')==latest
+    due=[t for t in tasks if not current(t)
+         and state.get(t['id'],{}).get('status') in ERROR_STATES
+         and state[t['id']].get('retry_on','9999') <= str(today)]
+    due.sort(key=lambda t: (state[t['id']]['retry_on'],
+                           state[t['id']].get('checked_date',''), t['id']))
+    promoted={t['id']:i for i,t in enumerate(due[:EARLY_RETRY_TASKS])}
     def priority(t):
-        if t['endpoint']=='session-cost' or t['params'].get('end_date')==latest: return 0
+        if current(t): return (0,0)
+        if t['id'] in promoted: return (1,promoted[t['id']])
         previous=state.get(t['id'])
-        if not previous or previous.get('status')=='pending': return 1
-        return 2
+        if not previous or previous.get('status')=='pending': return (2,0)
+        return (3,0)
     return sorted(tasks,key=priority)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
