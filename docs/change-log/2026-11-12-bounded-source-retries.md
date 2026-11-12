@@ -49,3 +49,27 @@ local test success alone is not evidence that the source error has recovered.
 
 Rollback, if needed, should revert only this code/documentation change. Do not
 restore an old checkpoint or overwrite collected data.
+
+## First production verification (2026-11-12)
+
+Deployed code commit: `4779e4df1f967bd87c5e8d15534f5e25ba79d765`.
+The automatically triggered [run 43138486859](https://github.com/lyll23/OpenRouter-OS-Rankings-f/actions/runs/43138486859)
+passed tests, collected 450 requests, saved the archive and verified remote
+persistence at `1c7e5277932dc594127b95b44128a0a01c2616b2`. No manual dispatch.
+
+All three previously deferred historical failures reached the priority lane:
+
+- Attempt 0096: September 24 programming-app/trending, HTTP 200, 20 rows.
+- Attempts 0097–0098: August 7 overall/trending, HTTP 200, 105 unique rows.
+  Pagination is complete, but page generation metadata differs; this does not
+  establish a strict same-time research snapshot.
+- Attempt 0099: April 14 audio-gen/trending, HTTP 200 with a valid empty list.
+  Recorded source_empty, not zero usage; the existing old-empty policy schedules
+  its next eligible check for February 10, 2027.
+
+All four responses were independently downloaded from the remote Git objects:
+Git blob hash, gzip SHA256, decompressed body SHA256/length, schema, identities,
+cross-page uniqueness and row counts passed. Previous raw, attempts, reports and
+version objects were unchanged; only new data were appended, alongside the
+expected checkpoint/latest-report updates. This verifies the priority mechanism
+in production, not that every historic dataset or upstream response is complete.
