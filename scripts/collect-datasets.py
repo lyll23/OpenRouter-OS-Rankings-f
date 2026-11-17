@@ -99,6 +99,42 @@ def plan(today):
         if t['id'] not in seen: seen.add(t['id']); unique.append(t)
     return unique
 
+def restore_due_failures(tasks, state, today):
+    """Restore expired rolling queries without changing their saved identity.
+
+    Only queries from the original day's supported plan may be restored. The
+    checkpoint is not a source of arbitrary endpoints or new query parameters.
+    Existing attempts/raw remain immutable; collect() appends a new attempt.
+    """
+    merged = list(tasks)
+    present = {t['id'] for t in tasks}
+    historical_plans = {}
+    for task_id, previous in sorted(state.items()):
+        if task_id in present or previous.get('status') not in ERROR_STATES:
+            continue
+        try:
+            retry = dt.date.fromisoformat(previous['retry_on'])
+            checked = dt.date.fromisoformat(previous['checked_date'])
+            # checked_date moves forward after each retry; the query's end
+            # date retains its original planning day across repeated failures.
+            original_day = dt.date.fromisoformat(previous['params']['end_date']) + dt.timedelta(days=1)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('invalid_orphan_failure_dates')
+        if retry > today:
+            continue
+        if checked > today or original_day > checked:
+            raise ValueError('future_orphan_failure')
+        if original_day not in historical_plans:
+            historical_plans[original_day] = {t['id']: t for t in plan(original_day)}
+        original = historical_plans[original_day].get(task_id)
+        if (original is None or original['endpoint'] != previous.get('endpoint')
+                or original['params'] != previous.get('params')
+                or original['family'] != previous.get('family')):
+            raise ValueError('invalid_orphan_failure_identity')
+        merged.append(original)
+        present.add(task_id)
+    return merged
+
 def reserve(root, lease_id, today, requested):
     root=Path(root); state=load_json(root/'checkpoint.json',{'version':1,'tasks':{},'budget':{}})
     leases=state.setdefault('leases',{})
@@ -223,6 +259,7 @@ class Collector:
         return record,body,str(record_path.relative_to(self.root))
     def collect(self,t):
         previous=self.state['tasks'].get(t['id'],{})
+        initial_requests=self.run['requests']
         # Resume partial pagination only for the same UTC fetch day. A new day restarts,
         # avoiding combining pages from distinct weekly session snapshots.
         pages=previous.get('pages',[]) if previous.get('checked_date')==str(self.today) and previous.get('status')=='pending' else []
@@ -236,7 +273,12 @@ class Collector:
             params=dict(t['params'])
             if paged: params.update(limit=size,offset=offset)
             result=self.request(t,params)
-            if result is None: self.save(); return
+            if result is None:
+                # An exhausted lease/budget is not an attempted retry. Do not
+                # erase the failed query's eligibility before any request.
+                if self.run['requests']==initial_requests and previous.get('status') in ERROR_STATES:
+                    self.state['tasks'][t['id']]=previous
+                self.save(); return
             record,body,record_path=result
             if body is None:
                 status=record['http_status']
@@ -272,6 +314,8 @@ class Collector:
         self.save()
     def execute(self):
         tasks=probe_plan(self.today) if self.probe else plan(self.today)
+        if not self.probe:
+            tasks=restore_due_failures(tasks,self.state['tasks'],self.today)
         for t in prioritize(tasks,self.state['tasks'],self.today):
             if eligible(t,self.state['tasks'].get(t['id']),self.today): self.collect(t)
             if self.stop: break
